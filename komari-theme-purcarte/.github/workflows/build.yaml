@@ -1,0 +1,113 @@
+name: Build and Release Assets
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install Yarn
+        run: npm install -g yarn
+
+      - name: Install dependencies
+        run: yarn
+
+      - name: Build project
+        run: yarn build
+
+      - name: Update theme configuration
+        run: |
+          # Extract version from tag (remove 'v' prefix)
+          VERSION=${GITHUB_REF_NAME#v}
+
+          # Validate semantic version format (X.Y.Z)
+          if ! echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "Error: Version '$VERSION' is not a valid semantic version (X.Y.Z format)"
+            echo "Expected format: X.Y.Z (e.g., 1.2.3)"
+            exit 1
+          fi
+
+          echo "Valid semantic version detected: $VERSION"
+          echo "VERSION=${VERSION}" >> $GITHUB_ENV
+
+          # Update komari-theme.json with new version
+          jq --arg version "$VERSION" \
+              '.version = $version' \
+              komari-theme.json > komari-theme-updated.json
+
+          mv komari-theme-updated.json komari-theme.json
+
+          echo "Updated theme configuration:"
+          cat komari-theme.json
+
+      - name: Verify required files exist
+        run: |
+          echo "Checking required files..."
+          ls -la preview.png || (echo "preview.png not found" && exit 1)
+          ls -la komari-theme.json || (echo "komari-theme.json not found" && exit 1)
+          ls -la dist/ || (echo "dist/ directory not found" && exit 1)
+          echo "All required files found!"
+
+      - name: Create theme package
+        run: |
+          # Create a temporary directory for the package
+          mkdir -p theme-package
+
+          # Copy required files
+          cp preview.png theme-package/
+          cp komari-theme.json theme-package/
+          cp -r dist/ theme-package/
+
+          # Create zip file with version and commit hash
+          ZIP_NAME="komari-theme-purcarte.zip"
+
+          cd theme-package
+          zip -r ../${ZIP_NAME} .
+          cd ..
+
+          echo "ZIP_NAME=${ZIP_NAME}" >> $GITHUB_ENV
+          echo "Created package: ${ZIP_NAME}"
+          ls -la ${ZIP_NAME}
+
+      - name: Generate Changelog
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        id: changelog
+        run: |
+          git fetch --prune
+          PREVIOUS_TAG=$(git describe --tags --abbrev=0 `git rev-list --tags --skip=1 --max-count=1` 2>/dev/null || git rev-list --max-parents=0 HEAD)
+          echo "Previous tag: $PREVIOUS_TAG"
+          CHANGELOG=$(git log $PREVIOUS_TAG..${{ github.ref_name }} --pretty=format:"* %s (%h)")
+          echo "CHANGELOG<<EOF" >> $GITHUB_ENV
+          echo "$CHANGELOG" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+
+      - name: Create Release
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Release ${{ github.ref_name }}
+          body: ${{ env.CHANGELOG }}
+          draft: false
+          prerelease: false
+          files: ${{ env.ZIP_NAME }}
